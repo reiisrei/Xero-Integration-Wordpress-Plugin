@@ -132,13 +132,14 @@ function auto_trigger_xero_oauth() {
     if (is_page($signup_slug)) { // Replace with the actual slug or ID of your landing page
         $state = wp_generate_password(12, false); // Generate a unique state string
         // Store $state in user session or database to validate later
-        $auth_url = "https://login.xero.com/identity/connect/authorize?response_type=code&client_id=" . XERO_CLIENT_ID . "&redirect_uri=" . urlencode(XERO_REDIRECT_URI) . "&scope=openid profile email&state=" . $state;
+        $auth_url = "https://login.xero.com/identity/connect/authorize?response_type=code&client_id=" . XERO_CLIENT_ID . "&redirect_uri=" . urlencode(XERO_REDIRECT_URI) . "&scope=openid profile email accounting.settings.read&state=" . $state;
         wp_redirect($auth_url);
         exit;
     }
 }
 
 function xero_oauth_callback() {
+
     if (isset($_GET['code']) && isset($_GET['state'])) {
         // Verify the state parameter
         // Retrieve and validate the state from user session or database
@@ -155,34 +156,103 @@ function xero_oauth_callback() {
             ],
         ]);
 
-        if (is_wp_error($response)) {
-            // Handle error
-            return;
+        if (!is_wp_error($response)) {
+
+            $body = wp_remote_retrieve_body($response);
+            $data = json_decode($body);
+            $access_token = $data->access_token;
+
+            // Make an API call to the Connections endpoint to get the tenant ID
+            $connections_url = 'https://api.xero.com/connections';
+            $connections_response = wp_remote_get($connections_url, [
+                'headers' => [
+                    'Authorization' => 'Bearer ' . $access_token,
+                    'Content-Type' => 'application/json'
+                ]
+            ]);
+
+            if (!is_wp_error($connections_response)) {
+                $connections_body = wp_remote_retrieve_body($connections_response);
+                $connections_data = json_decode($connections_body);
+
+                // Assume the first connection is the required one
+                $xero_tenant_id = $connections_data[0]->tenantId;
+
+
+                // Make an additional API call to get the business name
+                $org_url = 'https://api.xero.com/api.xro/2.0/Organisations';
+                $org_response = wp_remote_get($org_url, [
+                    'headers' => [
+                        'Authorization' => 'Bearer ' . $access_token,
+                        'Content-Type' => 'application/json',
+                        'Xero-tenant-id' => $xero_tenant_id // You need to set the correct Xero tenant ID here
+                    ]
+                ]);
+                
+                if (!is_wp_error($org_response)) {
+                    $org_body = wp_remote_retrieve_body($org_response);
+
+                    // Parse XML response
+                    $org_data = simplexml_load_string($org_body);
+
+
+                    if ($org_data && !empty($org_data->Organisations->Organisation)) {
+                        // Assuming the first organization is the required one
+                        $business_name = (string)$org_data->Organisations->Organisation[0]->LegalName;
+
+                        $organisation = $org_data->Organisations->Organisation;
+
+                        // Assuming that the phone details are within the Phones->Phone object
+                        if (!empty($organisation->Phones->Phone)) {
+                            $phoneObject = $organisation->Phones->Phone;
+                            $phoneCountryCode = (isset($phoneObject->PhoneCountryCode)) ? (string)$phoneObject->PhoneCountryCode : '';
+                            $phoneNumber = (isset($phoneObject->PhoneNumber)) ? (string)$phoneObject->PhoneNumber : '';
+                            
+                            $formattedPhone = $phoneNumber 
+                                ? "$phoneCountryCode $phoneNumber" 
+                                : '';
+                            // Use $phoneNumber, $phoneType, and $phoneCountryCode as needed
+
+                        } else {
+                            error_log('Phone information not found in the XML response');
+                            // Handle the case where phone data is not found
+                        }
+
+                    } else {
+                        error_log('No organisation data found in the XML response');
+                        // Handle the case where no data is found
+                    }
+                }
+
+            } 
+
+            $body = wp_remote_retrieve_body($response);
+            $data = json_decode($body);
+            
+            $id_token = $data->id_token;
+
+            $parts = explode(".", $id_token);
+            $payload = $parts[1];
+            $decoded_payload = base64_decode($payload);
+            $user_details = json_decode($decoded_payload);
+
+            // Redirect to the form page with user details
+            $query = http_build_query([
+                'email' => $user_details->email,
+                'firstname' => $user_details->given_name,
+                'lastname' => $user_details->family_name,
+                'xero_user_id_' => $user_details->xero_userid,
+                'company' => $business_name,
+                'phone' => $formattedPhone
+            ]);
+
+            $redirect_url = get_option('xero_oauth_redirect_url', 'https://default-redirect.com/');
+            wp_redirect($redirect_url . '?' . $query);
+            exit;
+            
+            // Use $data->access_token and $data->id_token as needed
+            // Redirect to a page with the HubSpot form or handle the data as needed
         }
-
-        $body = wp_remote_retrieve_body($response);
-        $data = json_decode($body);
-        
-        $id_token = $data->id_token;
-        $parts = explode(".", $id_token);
-        $payload = $parts[1];
-        $decoded_payload = base64_decode($payload);
-        $user_details = json_decode($decoded_payload);
-
-        // Redirect to the form page with user details
-        $query = http_build_query([
-            'email' => $user_details->email,
-            'firstname' => $user_details->given_name,
-            'lastname' => $user_details->family_name,
-            'xero_user_id_' => $user_details->xero_userid
-        ]);
-
-        $redirect_url = get_option('xero_oauth_redirect_url', 'https://default-redirect.com/');
-        wp_redirect($redirect_url . '?' . $query);
-        exit;
-        // Use $data->access_token and $data->id_token as needed
-        // Redirect to a page with the HubSpot form or handle the data as needed
     }
+
 }
-
-
